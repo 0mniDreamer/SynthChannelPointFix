@@ -26,7 +26,7 @@ Drop `SynthChannelPoints.dll` into your `Mods` folder:
 
 ## Setting up rewards
 
-Create channel point rewards on your Twitch dashboard named **exactly like the chat command**, including the prefix. For song requests: a reward titled `!srr` with "Require Viewer to Enter Text" enabled — the viewer's text is the song search. Other commands follow the same pattern (e.g. `!timewarp`). This is the naming the game itself expects; the mod doesn't change it.
+Create channel point rewards on your Twitch dashboard named **exactly like the chat command**, including the prefix. For song requests: a reward titled `!srr` with "Require Viewer to Enter Text" enabled — the viewer's text is the song search. Other commands follow the same pattern (e.g. `!timewarp`). This is the naming the game itself expects; the mod doesn't change it. for more details information on how to set up your channel points like the game recommends then follow this [guide](https://docs.google.com/document/d/13Ei4bYQRvvhUBIl4Uc5rwls-gvzsQ78bXoJQKQ_qaLo/edit?pli=1&tab=t.0#heading=h.cn2lvua9cxv4)
 
 ## Config (`UserData/MelonPreferences.cfg` → `[SynthChannelPoints]`)
 
