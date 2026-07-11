@@ -10,7 +10,7 @@ This mod fixes redemptions by bridging Twitch's replacement service (EventSub) i
 
 - Channel point redemptions work again — song requests, effects, everything the game supported
 - **Zero setup**: uses the game's existing Twitch login; no separate authentication, no tokens to paste
-- **Auto-created rewards** (v1.1): the mod creates the channel point rewards for you (default: `!srr` song requests) after a one-time permission approval
+- **Auto-created rewards** (v1.1): the mod creates channel point rewards for every game feature you enable — song requests, timewarp, speed, colors, effects — after a one-time permission approval. A reward is created the first time you enable its feature in the game's Twitch settings
 - **Settings mirroring** (v1.1): turning a feature off in the game's Twitch settings disables its reward on Twitch, and vice versa
 - **Point refunds** (v1.1): failed song requests (song not found, queue full, limits hit) automatically refund the viewer's points; successful ones are marked fulfilled
 - The game's own logic handles everything downstream — reward matching, queue, cooldowns, per-user limits, and chat replies behave exactly as they originally did
@@ -47,7 +47,7 @@ Create channel point rewards on your Twitch dashboard named **exactly like the c
 | `HelixSubscriptionsUrl` | `https://api.twitch.tv/helix/eventsub/subscriptions` | Subscription endpoint (change only for mock testing) |
 | `SuppressGamePubSubConnect` | `true` | Stops the game retrying the dead PubSub endpoint |
 | `ManageRewards` | `true` | Auto-create rewards, mirror settings, enable refunds (needs one-time re-consent) |
-| `RewardCommands` | `srr:500:input` | Rewards to manage: `command[:cost][:input]`, comma-separated |
+| `RewardCommands` | all game commands | Rewards to manage: `command[:cost][:input]`, comma-separated |
 | `CommandPrefix` | `!` | Prefix used in reward titles |
 | `RefundFailedRequests` | `true` | Refund points when a song request fails |
 | `AutoCompleteRequests` | `true` | Mark successful requests FULFILLED |
@@ -64,6 +64,10 @@ Create channel point rewards on your Twitch dashboard named **exactly like the c
 **"Helix rejected the subscription (403)"** — your Twitch account doesn't have channel points available (Affiliate/Partner required).
 
 **"Non-default endpoints configured"** — you previously tested against the Twitch CLI mock server; delete the two URL entries from `MelonPreferences.cfg` (they'll regenerate with live defaults).
+
+**`!invaderz` redemptions reply "N Bits until the next Invader"** — working as designed: the Invaderz feature runs on a bits meter, and a redemption contributes its point cost toward it (shared with real cheered bits). Two 300-point redemptions against a 500-bit threshold spawn one invader. For one-redemption-one-invader, set the reward cost to meet your in-game bits threshold (e.g. `invaderz:500` in `RewardCommands`) or lower the threshold in the game's Twitch settings.
+
+**No `!srr` reward appears (but effect rewards do)** — the song-request reward mirrors a dedicated toggle in the game's Twitch settings (separate from chat requests). Enable it in-game and the reward is created within ~16 seconds.
 
 **Redemptions arrive but nothing happens in game** — check the reward title matches the chat command exactly (including `!`), and that Channel Point Mode + the specific feature are enabled in the game's Twitch settings.
 

@@ -11,7 +11,7 @@ using System.Threading.Tasks;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(SynthChannelPoints.Core), "SynthChannelPoints", "1.1.0", "OmniDreamer")]
+[assembly: MelonInfo(typeof(SynthChannelPoints.Core), "SynthChannelPoints", "1.1.1", "OmniDreamer")]
 [assembly: MelonGame(null, null)]
 
 namespace SynthChannelPoints
@@ -30,7 +30,7 @@ namespace SynthChannelPoints
     public class Core : MelonMod
     {
         private const string ManageScope = "channel:manage:redemptions";
-        private const int RefundDeadlineSeconds = 15;
+        private const int RefundDeadlineSeconds = 30; // live-observed QueueAdd latency up to ~16s
 
         // ------------------------------------------------------------------
         // Config
@@ -87,21 +87,26 @@ namespace SynthChannelPoints
             "SynthChannelPoints"
         };
 
-        // Maps chat command -> game TwitchSettings feature toggle property.
-        private static readonly Dictionary<string, string> CommandToggleMap =
-            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        // Maps chat command -> game TwitchSettings feature toggle properties.
+        // Multiple candidates are OR'd if listed. srr maps strictly to
+        // RewardRequest: it is a real in-game toggle (empirically confirmed —
+        // tester flipped it and the mirror followed), and the game likely gates
+        // redemption handling on it, so creating the reward while it's off
+        // would produce always-refunding redemptions.
+        private static readonly Dictionary<string, string[]> CommandToggleMap =
+            new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
-            { "srr", "RewardRequest" },
-            { "timewarp", "Timewarp" },
-            { "speed", "Speed" },
-            { "superspeed", "Superspeed" },
-            { "color", "Color" },
-            { "rainbow", "Rainbow" },
-            { "vanish", "Vanish" },
-            { "embiggen", "Embiggen" },
-            { "minimize", "Minimize" },
-            { "warp", "Warp" },
-            { "invaderz", "Invaderz" }
+            { "srr", new[] { "RewardRequest" } },
+            { "timewarp", new[] { "Timewarp" } },
+            { "speed", new[] { "Speed" } },
+            { "superspeed", new[] { "Superspeed" } },
+            { "color", new[] { "Color" } },
+            { "rainbow", new[] { "Rainbow" } },
+            { "vanish", new[] { "Vanish" } },
+            { "embiggen", new[] { "Embiggen" } },
+            { "minimize", new[] { "Minimize" } },
+            { "warp", new[] { "Warp" } },
+            { "invaderz", new[] { "Invaderz" } }
         };
 
         // ------------------------------------------------------------------
@@ -204,7 +209,8 @@ namespace SynthChannelPoints
                 description: "Prevent the game from retrying its dead PubSub endpoint (decommissioned April 2025).");
             _manageRewards = cat.CreateEntry("ManageRewards", true,
                 description: "Auto-create channel point rewards for enabled features and mirror the game's Twitch settings toggles. Requires a one-time Twitch re-consent (the game will prompt).");
-            _rewardCommands = cat.CreateEntry("RewardCommands", "srr:500:input",
+            _rewardCommands = cat.CreateEntry("RewardCommands",
+                "srr:500:input,timewarp:200,speed:200,superspeed:300,color:100,rainbow:150,vanish:200,embiggen:150,minimize:150,warp:250,invaderz:300",
                 description: "Rewards to manage, comma-separated. Format: command[:cost][:input]. 'input' marks rewards requiring viewer text (song requests).");
             _commandPrefix = cat.CreateEntry("CommandPrefix", "!",
                 description: "Chat command prefix used in reward titles.");
@@ -215,15 +221,20 @@ namespace SynthChannelPoints
 
             _rewardSpecs = ParseRewardSpecs(_rewardCommands.Value, _commandPrefix.Value);
 
-            LoggerInstance.Msg("SynthChannelPoints v1.1.0 loaded — channel point redemptions via EventSub.");
+            LoggerInstance.Msg("SynthChannelPoints v1.1.1 loaded — channel point redemptions via EventSub.");
 
             const string defaultEventSub = "wss://eventsub.wss.twitch.tv/ws";
             const string defaultHelix = "https://api.twitch.tv/helix/eventsub/subscriptions";
+            const string defaultBase = "https://api.twitch.tv/helix";
             if (!string.Equals(_eventSubUrl.Value, defaultEventSub, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(_helixSubUrl.Value, defaultHelix, StringComparison.OrdinalIgnoreCase))
+                !string.Equals(_helixSubUrl.Value, defaultHelix, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(_helixBaseUrl.Value, defaultBase, StringComparison.OrdinalIgnoreCase))
             {
-                LoggerInstance.Warning($"Non-default endpoints configured (EventSubUrl={_eventSubUrl.Value}, HelixSubscriptionsUrl={_helixSubUrl.Value}). If you previously tested with the Twitch CLI mock server, reset these in MelonPreferences.cfg for live use.");
+                LoggerInstance.Warning($"Non-default endpoints configured (EventSubUrl={_eventSubUrl.Value}, HelixSubscriptionsUrl={_helixSubUrl.Value}, HelixBaseUrl={_helixBaseUrl.Value}). If you previously tested with the Twitch CLI mock server, reset these in MelonPreferences.cfg for live use.");
             }
+            WarnIfTlsToLocalhost("EventSubUrl", _eventSubUrl.Value);
+            WarnIfTlsToLocalhost("HelixSubscriptionsUrl", _helixSubUrl.Value);
+            WarnIfTlsToLocalhost("HelixBaseUrl", _helixBaseUrl.Value);
         }
 
         public override void OnUpdate()
@@ -436,8 +447,16 @@ namespace SynthChannelPoints
                 foreach (var spec in _rewardSpecs)
                 {
                     var featureOn = true;
-                    if (CommandToggleMap.TryGetValue(spec.Command, out var propName))
-                        featureOn = ReadBool(st, settings, propName) ?? true;
+                    if (CommandToggleMap.TryGetValue(spec.Command, out var propNames))
+                    {
+                        bool? any = null;
+                        foreach (var pn in propNames)
+                        {
+                            var v = ReadBool(st, settings, pn);
+                            if (v.HasValue) any = (any ?? false) || v.Value;
+                        }
+                        featureOn = any ?? true;
+                    }
                     map[spec.Title] = cpm && featureOn;
                 }
                 _desiredEnabled = map;
@@ -741,6 +760,7 @@ namespace SynthChannelPoints
                                 if (subType == "channel.channel_points_custom_reward_redemption.add")
                                 {
                                     var ev = payload.GetProperty("event");
+                                    if (TryHandleEmptyInput(ev)) break;
                                     var envelope = BuildEnvelopeFromEventSub(ev);
                                     if (envelope != null)
                                     {
@@ -928,6 +948,7 @@ namespace SynthChannelPoints
             http.Timeout = TimeSpan.FromSeconds(15);
 
             var tick = 0;
+            var consecutiveForbidden = 0;
             var remoteEnabled = new Dictionary<string, bool>(); // reward id -> is_enabled
 
             while (!ct.IsCancellationRequested)
@@ -947,10 +968,18 @@ namespace SynthChannelPoints
                     await ProcessPendingAsync(http, creds, clientId, ct).ConfigureAwait(false);
 
                     // Slow path every ~16s: ensure rewards exist and mirror toggles.
-                    if (tick % 8 != 0) continue;
+                    // After repeated 403s (no affiliate — won't change mid-session),
+                    // back off to roughly every 5 minutes.
+                    var interval = consecutiveForbidden >= 3 ? 160 : 8;
+                    if (tick % interval != 0) continue;
 
                     var rewards = await GetManageableRewardsAsync(http, creds, clientId, ct).ConfigureAwait(false);
-                    if (rewards == null) continue;
+                    if (rewards == null)
+                    {
+                        if (_lastRewardListForbidden) consecutiveForbidden++;
+                        continue;
+                    }
+                    consecutiveForbidden = 0;
 
                     lock (_managedRewards)
                     {
@@ -974,12 +1003,14 @@ namespace SynthChannelPoints
                     {
                         string existingId = null;
                         var existingEnabled = false;
+                        long existingCost = 0;
                         foreach (var kv in rewards)
                         {
                             if (string.Equals(kv.Value.Title, spec.Title, StringComparison.OrdinalIgnoreCase))
                             {
                                 existingId = kv.Key;
                                 existingEnabled = kv.Value.Enabled;
+                                existingCost = kv.Value.Cost;
                                 break;
                             }
                         }
@@ -988,7 +1019,11 @@ namespace SynthChannelPoints
 
                         if (existingId == null)
                         {
-                            var newId = await CreateRewardAsync(http, creds, clientId, spec, wantEnabled, ct).ConfigureAwait(false);
+                            // Only create a reward once its feature is enabled in the
+                            // game's Twitch settings — the in-game panel is the control
+                            // surface. Existing rewards are mirrored, never deleted.
+                            if (!wantEnabled) continue;
+                            var newId = await CreateRewardAsync(http, creds, clientId, spec, true, ct).ConfigureAwait(false);
                             if (newId != null)
                             {
                                 lock (_managedRewards) { _managedRewards[newId] = spec; }
@@ -999,12 +1034,21 @@ namespace SynthChannelPoints
                         }
 
                         remoteEnabled[existingId] = existingEnabled;
-                        if (desired != null && existingEnabled != wantEnabled)
+                        var enabledDrift = desired != null && existingEnabled != wantEnabled;
+                        var costDrift = existingCost > 0 && existingCost != spec.Cost;
+                        if (enabledDrift || costDrift)
                         {
-                            if (await PatchRewardEnabledAsync(http, creds, clientId, existingId, wantEnabled, ct).ConfigureAwait(false))
+                            if (await PatchRewardAsync(http, creds, clientId, existingId,
+                                    enabledDrift ? (bool?)wantEnabled : null,
+                                    costDrift ? (long?)spec.Cost : null, ct).ConfigureAwait(false))
                             {
-                                remoteEnabled[existingId] = wantEnabled;
-                                LoggerInstance.Msg($"Reward '{spec.Title}' {(wantEnabled ? "enabled" : "disabled")} (mirroring game settings).");
+                                if (enabledDrift)
+                                {
+                                    remoteEnabled[existingId] = wantEnabled;
+                                    LoggerInstance.Msg($"Reward '{spec.Title}' {(wantEnabled ? "enabled" : "disabled")} (mirroring game settings).");
+                                }
+                                if (costDrift)
+                                    LoggerInstance.Msg($"Reward '{spec.Title}' cost updated to {spec.Cost} points (from config).");
                             }
                         }
                     }
@@ -1017,6 +1061,69 @@ namespace SynthChannelPoints
                 {
                     Debug($"Manage loop error: {ex.Message}");
                 }
+            }
+        }
+
+        // Empirically (probe, 2026-07-11): the game's handler silently consumes
+        // an input-requiring redemption with empty text — no command dispatch, no
+        // song, but the viewer's points and request slot are spent. Live
+        // input-required rewards can't produce empty text, but manually created
+        // rewards without required text can. Drop the injection and refund
+        // instead — strictly better for the viewer than the game's behavior.
+        private bool TryHandleEmptyInput(JsonElement ev)
+        {
+            try
+            {
+                var userInput = ev.TryGetProperty("user_input", out var ui) && ui.ValueKind == JsonValueKind.String
+                    ? ui.GetString() : "";
+                if (!string.IsNullOrWhiteSpace(userInput)) return false;
+
+                string title = null, rewardId = null;
+                if (ev.TryGetProperty("reward", out var reward) && reward.ValueKind == JsonValueKind.Object)
+                {
+                    title = reward.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
+                    rewardId = reward.TryGetProperty("id", out var ri) && ri.ValueKind == JsonValueKind.String ? ri.GetString() : null;
+                }
+                if (string.IsNullOrEmpty(title)) return false;
+
+                RewardSpec matched = null;
+                foreach (var spec in _rewardSpecs)
+                {
+                    if (spec.RequiresInput && string.Equals(spec.Title, title, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matched = spec;
+                        break;
+                    }
+                }
+                if (matched == null) return false; // not an input reward -> inject normally
+
+                LoggerInstance.Warning($"Dropped redemption of '{title}' with empty input — the game would silently consume it without queuing anything. If this reward was created manually, enable 'Require Viewer to Enter Text' on your Twitch dashboard.");
+
+                if (!string.IsNullOrEmpty(rewardId) && _refundFailedRequests.Value)
+                {
+                    bool managed;
+                    lock (_managedRewards) { managed = _managedRewards.ContainsKey(rewardId); }
+                    if (managed)
+                    {
+                        var p = new Pending
+                        {
+                            RedemptionId = ev.TryGetProperty("id", out var idEl) ? idEl.GetString() : null,
+                            RewardId = rewardId,
+                            UserLogin = ev.TryGetProperty("user_login", out var ul) ? ul.GetString() : null,
+                            UserName = ev.TryGetProperty("user_name", out var un) ? un.GetString() : null,
+                            DeadlineUtc = DateTime.MinValue // refund on the next manage tick
+                        };
+                        if (!string.IsNullOrEmpty(p.RedemptionId))
+                        {
+                            lock (_pending) { _pending.Add(p); }
+                        }
+                    }
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -1110,10 +1217,13 @@ namespace SynthChannelPoints
         // Helix reward endpoints
         // ------------------------------------------------------------------
 
+        private volatile bool _lastRewardListForbidden;
+
         private sealed class RemoteReward
         {
             public string Title;
             public bool Enabled;
+            public long Cost;
         }
 
         private async Task<Dictionary<string, RemoteReward>> GetManageableRewardsAsync(HttpClient http, Creds creds, string clientId, CancellationToken ct)
@@ -1128,12 +1238,14 @@ namespace SynthChannelPoints
                 var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
                 if (!resp.IsSuccessStatusCode)
                 {
-                    if ((int)resp.StatusCode == 403)
+                    _lastRewardListForbidden = (int)resp.StatusCode == 403;
+                    if (_lastRewardListForbidden)
                         RateWarn("rewards-403", "Twitch rejected reward access (403) — channel points require Affiliate/Partner. Reward management disabled until then.");
                     else
                         Debug($"Reward list failed ({(int)resp.StatusCode}): {Truncate(body, 150)}");
                     return null;
                 }
+                _lastRewardListForbidden = false;
 
                 var result = new Dictionary<string, RemoteReward>();
                 using var doc = JsonDocument.Parse(body);
@@ -1146,7 +1258,8 @@ namespace SynthChannelPoints
                         result[id] = new RemoteReward
                         {
                             Title = item.TryGetProperty("title", out var t) ? t.GetString() : "",
-                            Enabled = item.TryGetProperty("is_enabled", out var e) && e.ValueKind == JsonValueKind.True
+                            Enabled = item.TryGetProperty("is_enabled", out var e) && e.ValueKind == JsonValueKind.True,
+                            Cost = item.TryGetProperty("cost", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetInt64() : 0
                         };
                     }
                 }
@@ -1209,15 +1322,19 @@ namespace SynthChannelPoints
             }
         }
 
-        private async Task<bool> PatchRewardEnabledAsync(HttpClient http, Creds creds, string clientId, string rewardId, bool enabled, CancellationToken ct)
+        private async Task<bool> PatchRewardAsync(HttpClient http, Creds creds, string clientId, string rewardId, bool? enabled, long? cost, CancellationToken ct)
         {
             try
             {
                 var url = $"{_helixBaseUrl.Value}/channel_points/custom_rewards?broadcaster_id={Uri.EscapeDataString(creds.UserId)}&id={Uri.EscapeDataString(rewardId)}";
+                var parts = new List<string>();
+                if (enabled.HasValue) parts.Add("\"is_enabled\":" + (enabled.Value ? "true" : "false"));
+                if (cost.HasValue) parts.Add("\"cost\":" + cost.Value);
+                if (parts.Count == 0) return true;
                 using var req = new HttpRequestMessage(HttpMethod.Patch, url);
                 req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + creds.AccessToken);
                 req.Headers.TryAddWithoutValidation("Client-Id", clientId);
-                req.Content = new StringContent("{\"is_enabled\":" + (enabled ? "true" : "false") + "}", Encoding.UTF8, "application/json");
+                req.Content = new StringContent("{" + string.Join(",", parts) + "}", Encoding.UTF8, "application/json");
                 using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
                 if (!resp.IsSuccessStatusCode)
                 {
@@ -1436,6 +1553,26 @@ namespace SynthChannelPoints
                 _warnRepeat = 1;
             }
             LoggerInstance.Warning(message);
+        }
+
+        // The Twitch CLI mock server speaks plain http/ws; a https/wss scheme
+        // pointed at localhost fails with an opaque SSL error. Catch it early.
+        private void WarnIfTlsToLocalhost(string entryName, string url)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(url)) return;
+                var u = new Uri(url);
+                var isLocal = string.Equals(u.Host, "localhost", StringComparison.OrdinalIgnoreCase) ||
+                              u.Host == "127.0.0.1" || u.Host == "::1";
+                var isTls = string.Equals(u.Scheme, "https", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(u.Scheme, "wss", StringComparison.OrdinalIgnoreCase);
+                if (isLocal && isTls)
+                {
+                    LoggerInstance.Warning($"{entryName} uses {u.Scheme}:// against {u.Host} — the Twitch CLI mock server is plain {(u.Scheme.StartsWith("w", StringComparison.OrdinalIgnoreCase) ? "ws" : "http")}://. This will fail with SSL errors; fix the scheme in MelonPreferences.cfg.");
+                }
+            }
+            catch { }
         }
 
         private void Debug(string message)
