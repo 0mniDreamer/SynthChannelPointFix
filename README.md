@@ -80,3 +80,6 @@ The mod reads the game's own Twitch credentials via reflection, opens an EventSu
 ## Building from source
 
 Set `<GamePath>` in `SynthChannelPoints.csproj` to your Synth Riders install, then `dotnet build -c Release`. Requires the game to have been run once with MelonLoader so the interop assemblies exist.
+
+## Special Thanks 
+Thanks to [Blatzk](https://www.twitch.tv/blatzk)) for affiliate testing and everyone else that offered.
