@@ -10,8 +10,17 @@ This mod fixes redemptions by bridging Twitch's replacement service (EventSub) i
 
 - Channel point redemptions work again — song requests, effects, everything the game supported
 - **Zero setup**: uses the game's existing Twitch login; no separate authentication, no tokens to paste
+- **Auto-created rewards** (v1.1): the mod creates the channel point rewards for you (default: `!srr` song requests) after a one-time permission approval
+- **Settings mirroring** (v1.1): turning a feature off in the game's Twitch settings disables its reward on Twitch, and vice versa
+- **Point refunds** (v1.1): failed song requests (song not found, queue full, limits hit) automatically refund the viewer's points; successful ones are marked fulfilled
 - The game's own logic handles everything downstream — reward matching, queue, cooldowns, per-user limits, and chat replies behave exactly as they originally did
 - Stops the game from endlessly retrying the dead PubSub endpoint
+
+## The one-time permission prompt (v1.1)
+
+Managing rewards needs one extra Twitch permission the game never asked for. The mod adds it to the game's own login request, so on first launch after updating, the game will walk you through a quick re-authorization in your browser (approve once, done). Everything except reward management works even if you skip it. Set `ManageRewards = false` to disable the feature and the prompt entirely.
+
+**Note:** refunds and settings mirroring only work for rewards the mod created — Twitch only allows the creating app to manage a reward. If you already made an `!srr` reward by hand, delete it on your dashboard and let the mod recreate it.
 
 ## Requirements
 
@@ -37,6 +46,12 @@ Create channel point rewards on your Twitch dashboard named **exactly like the c
 | `EventSubUrl` | `wss://eventsub.wss.twitch.tv/ws` | EventSub endpoint (change only for mock testing) |
 | `HelixSubscriptionsUrl` | `https://api.twitch.tv/helix/eventsub/subscriptions` | Subscription endpoint (change only for mock testing) |
 | `SuppressGamePubSubConnect` | `true` | Stops the game retrying the dead PubSub endpoint |
+| `ManageRewards` | `true` | Auto-create rewards, mirror settings, enable refunds (needs one-time re-consent) |
+| `RewardCommands` | `srr:500:input` | Rewards to manage: `command[:cost][:input]`, comma-separated |
+| `CommandPrefix` | `!` | Prefix used in reward titles |
+| `RefundFailedRequests` | `true` | Refund points when a song request fails |
+| `AutoCompleteRequests` | `true` | Mark successful requests FULFILLED |
+| `HelixBaseUrl` | `https://api.twitch.tv/helix` | Helix base for reward management |
 
 ## Troubleshooting
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+- **Automatic reward management** (`ManageRewards`, default on): the mod extends the game's Twitch permission request; after a one-time re-consent it auto-creates channel point rewards named after chat commands (default: `!srr`, configurable via `RewardCommands`)
+- **Settings mirroring**: rewards are enabled/disabled on Twitch to match the game's Twitch settings toggles (Channel Point Mode + per-feature switches)
+- **Point refunds** (`RefundFailedRequests`): song-request redemptions that don't result in a queued song are automatically CANCELED, returning the viewer's points
+- **Auto-complete** (`AutoCompleteRequests`): successful song requests are marked FULFILLED, keeping the Twitch redemption queue clean
+- Refunds/auto-complete only apply to mod-created rewards (a Twitch platform restriction); manually created rewards keep v1.0 behavior
+- Clean uninstall: removing the mod never forces a re-auth
+
 ## 1.0.2
 - Startup warning when non-default (mock/test) endpoints are left in the config
 - Release documentation
