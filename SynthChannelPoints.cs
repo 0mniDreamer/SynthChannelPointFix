@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Reflection;
@@ -9,9 +10,10 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using MelonLoader;
+using MelonLoader.Utils;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(SynthChannelPoints.Core), "SynthChannelPoints", "1.1.1", "OmniDreamer")]
+[assembly: MelonInfo(typeof(SynthChannelPoints.Core), "SynthChannelPoints", "1.2.2", "OmniDreamer")]
 [assembly: MelonGame(null, null)]
 
 namespace SynthChannelPoints
@@ -45,8 +47,12 @@ namespace SynthChannelPoints
         private MelonPreferences_Entry<bool> _manageRewards;
         private MelonPreferences_Entry<string> _rewardCommands;
         private MelonPreferences_Entry<string> _commandPrefix;
+        private MelonPreferences_Entry<string> _rewardDefinitions;
         private MelonPreferences_Entry<bool> _refundFailedRequests;
         private MelonPreferences_Entry<bool> _autoCompleteRequests;
+        private MelonPreferences_Entry<bool> _dedupeRedemptions;
+        private MelonPreferences_Entry<bool> _disableRewardsOnExit;
+        private MelonPreferences_Entry<bool> _rewardsFollowCpm;
 
         // ------------------------------------------------------------------
         // Cross-branch candidate name sets
@@ -117,6 +123,7 @@ namespace SynthChannelPoints
         {
             public string Command;
             public string Title;
+            public string Prompt;
             public long Cost;
             public bool RequiresInput;
         }
@@ -160,6 +167,7 @@ namespace SynthChannelPoints
 
         private volatile Creds _creds;
         private volatile Dictionary<string, bool> _desiredEnabled; // reward title -> enabled
+        private volatile bool _syncNow; // set when desired state changes; manage loop reacts within ~2s
         private volatile bool _canManage;
         private string _effectiveClientId; // set by validate; read cross-thread under _stateLock
         private readonly object _stateLock = new object();
@@ -184,6 +192,13 @@ namespace SynthChannelPoints
         // Client state
         // ------------------------------------------------------------------
 
+        private static MelonLogger.Instance SLog;
+        private static MelonPreferences_Entry<bool> DebugEntry;
+        private static bool DedupeEnabled;
+        private static int _dedupeBlockCount;
+        private static readonly ConcurrentDictionary<string, DateTime> RecentRedemptionIds =
+            new ConcurrentDictionary<string, DateTime>();
+
         private Task _clientTask;
         private Task _manageTask;
         private CancellationTokenSource _cts;
@@ -194,11 +209,26 @@ namespace SynthChannelPoints
 
         public override void OnInitializeMelon()
         {
+            SLog = LoggerInstance;
             var cat = MelonPreferences.CreateCategory("SynthChannelPoints");
+
+            // Own config file instead of the shared MelonPreferences.cfg.
+            // First run after updating: no dedicated file exists yet, so let the
+            // entries load their values from the legacy [SynthChannelPoints]
+            // section, then rehome them (migration). Every later run loads the
+            // dedicated file directly.
+            var configPath = Path.Combine(MelonEnvironment.UserDataDirectory, "SynthChannelPoints.cfg");
+            var migrateLegacyConfig = !File.Exists(configPath);
+            if (!migrateLegacyConfig)
+            {
+                cat.SetFilePath(configPath, true, false);
+            }
+
             _enabled = cat.CreateEntry("Enabled", true,
                 description: "Master switch. Set false to disable the mod without removing it.");
             _debugLogging = cat.CreateEntry("DebugLogging", false,
                 description: "Verbose diagnostic output.");
+            DebugEntry = _debugLogging;
             _eventSubUrl = cat.CreateEntry("EventSubUrl", "wss://eventsub.wss.twitch.tv/ws",
                 description: "EventSub WebSocket endpoint. Point at ws://127.0.0.1:8080/ws to test against the Twitch CLI mock server.");
             _helixSubUrl = cat.CreateEntry("HelixSubscriptionsUrl", "https://api.twitch.tv/helix/eventsub/subscriptions",
@@ -212,16 +242,44 @@ namespace SynthChannelPoints
             _rewardCommands = cat.CreateEntry("RewardCommands",
                 "srr:500:input,timewarp:200,speed:200,superspeed:300,color:100,rainbow:150,vanish:200,embiggen:150,minimize:150,warp:250,invaderz:300",
                 description: "Rewards to manage, comma-separated. Format: command[:cost][:input]. 'input' marks rewards requiring viewer text (song requests).");
+            _rewardDefinitions = cat.CreateEntry("RewardDefinitions",
+                "srr | Song Request | Request any song! Powered by !srr ; " +
+                "timewarp | Slow Motion | Slows the song (no score upload). !timewarp ; " +
+                "speed | Speed Up | Speeds the song up. !speed ; " +
+                "superspeed | Super Speed | Speeds the song up even more! !superspeed ; " +
+                "color | Random Colors | Randomises the note colours. !color ; " +
+                "rainbow | Rainbow Notes | Prismatic rainbow notes. !rainbow ; " +
+                "vanish | Vanishing Notes | Notes vanish as they fly in. !vanish ; " +
+                "embiggen | Big Notes | Bigger notes (no score upload). !embiggen ; " +
+                "minimize | Tiny Notes | Smaller notes. !minimize ; " +
+                "warp | Warp Mode | Trippy warp visuals. !warp ; " +
+                "invaderz | Invaderz | Adds an invader to the song! !invaderz",
+                description: "Optional custom reward names/descriptions. Format per reward: command | Title | Description | cost | input — rewards separated by ';'. Empty fields keep defaults. Example: srr | Song Request | Request any song! Powered by !srr | 500 | input ; timewarp | Slow Motion | Slows the song. !timewarp");
             _commandPrefix = cat.CreateEntry("CommandPrefix", "!",
                 description: "Chat command prefix used in reward titles.");
             _refundFailedRequests = cat.CreateEntry("RefundFailedRequests", true,
                 description: "Refund points automatically when a song-request redemption does not result in a queued song (only works for mod-created rewards).");
+            _rewardsFollowCpm = cat.CreateEntry("RewardsFollowChannelPointMode", true,
+                description: "true: rewards are hidden on Twitch while Channel Point Mode is off (chat-only vs rewards-only modes). false: rewards follow only their feature toggles, allowing chat and redemptions simultaneously (the game's vanilla semantics — channelpointmode only blocks chat).");
+            _disableRewardsOnExit = cat.CreateEntry("DisableRewardsOnExit", true,
+                description: "Disable all mod-managed rewards when the game closes, so viewers can't redeem while the game isn't running. They re-enable automatically on next launch.");
+            _dedupeRedemptions = cat.CreateEntry("DeduplicateRedemptions", true,
+                description: "Block the game from processing the same redemption twice (observed rarely when the game double-attaches its handler). Redemption ids are unique, so this can never block a legitimate redemption.");
             _autoCompleteRequests = cat.CreateEntry("AutoCompleteRequests", true,
                 description: "Mark successful song-request redemptions FULFILLED, clearing them from the Twitch redemption queue (only works for mod-created rewards).");
 
-            _rewardSpecs = ParseRewardSpecs(_rewardCommands.Value, _commandPrefix.Value);
+            if (migrateLegacyConfig)
+            {
+                cat.SetFilePath(configPath, false, false); // keep values loaded from the legacy file
+                cat.SaveToFile(false);
+                LoggerInstance.Msg("Config now lives in UserData/SynthChannelPoints.cfg (existing settings migrated). The old [SynthChannelPoints] section in MelonPreferences.cfg is no longer used and can be deleted.");
+            }
 
-            LoggerInstance.Msg("SynthChannelPoints v1.1.1 loaded — channel point redemptions via EventSub.");
+            _rewardSpecs = ParseRewardSpecs(_rewardCommands.Value, _commandPrefix.Value);
+            ApplyRewardDefinitions(_rewardSpecs, _rewardDefinitions.Value, _commandPrefix.Value);
+            EnsureCommandTokens();
+
+            LoggerInstance.Msg("SynthChannelPoints v1.2.2 loaded — channel point redemptions via EventSub.");
 
             const string defaultEventSub = "wss://eventsub.wss.twitch.tv/ws";
             const string defaultHelix = "https://api.twitch.tv/helix/eventsub/subscriptions";
@@ -230,7 +288,7 @@ namespace SynthChannelPoints
                 !string.Equals(_helixSubUrl.Value, defaultHelix, StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(_helixBaseUrl.Value, defaultBase, StringComparison.OrdinalIgnoreCase))
             {
-                LoggerInstance.Warning($"Non-default endpoints configured (EventSubUrl={_eventSubUrl.Value}, HelixSubscriptionsUrl={_helixSubUrl.Value}, HelixBaseUrl={_helixBaseUrl.Value}). If you previously tested with the Twitch CLI mock server, reset these in MelonPreferences.cfg for live use.");
+                LoggerInstance.Warning($"Non-default endpoints configured (EventSubUrl={_eventSubUrl.Value}, HelixSubscriptionsUrl={_helixSubUrl.Value}, HelixBaseUrl={_helixBaseUrl.Value}). If you previously tested with the Twitch CLI mock server, reset these in UserData/SynthChannelPoints.cfg for live use.");
             }
             WarnIfTlsToLocalhost("EventSubUrl", _eventSubUrl.Value);
             WarnIfTlsToLocalhost("HelixSubscriptionsUrl", _helixSubUrl.Value);
@@ -269,7 +327,41 @@ namespace SynthChannelPoints
 
         public override void OnApplicationQuit()
         {
+            try { DisableManagedRewardsOnExit(); } catch { }
             try { _cts?.Cancel(); } catch { }
+        }
+
+        // Best-effort, time-boxed: without this, enabled rewards linger in the
+        // channel's points menu after the game closes, and viewers redeem into
+        // a void with nothing running to respond or refund.
+        private void DisableManagedRewardsOnExit()
+        {
+            if (!_disableRewardsOnExit.Value || !_manageRewards.Value || !_canManage) return;
+            var creds = _creds;
+            if (creds == null || !creds.IsComplete) return;
+            string clientId;
+            lock (_stateLock) { clientId = _effectiveClientId ?? creds.ClientId; }
+
+            List<string> ids;
+            lock (_managedRewards) { ids = new List<string>(_managedRewards.Keys); }
+            if (ids.Count == 0) return;
+
+            try
+            {
+                using var http = new HttpClient();
+                http.Timeout = TimeSpan.FromSeconds(2);
+                var tasks = new List<Task>(ids.Count);
+                foreach (var id in ids)
+                {
+                    tasks.Add(PatchRewardAsync(http, creds, clientId, id, false, null, null, CancellationToken.None));
+                }
+                Task.WaitAll(tasks.ToArray(), 4000);
+                LoggerInstance.Msg($"Disabled {ids.Count} channel point reward(s) on exit — they re-enable on next launch.");
+            }
+            catch (Exception ex)
+            {
+                Debug($"Exit cleanup incomplete: {ex.Message}");
+            }
         }
 
         // ==================================================================
@@ -311,6 +403,7 @@ namespace SynthChannelPoints
             Debug("Game references resolved (TwitchBot + pubsub + TestMessageParser).");
 
             ApplyQueueAddPatch();
+            ApplyRedemptionDedupePatch();
         }
 
         private void ApplySuppressionPatch()
@@ -365,6 +458,77 @@ namespace SynthChannelPoints
             catch (Exception ex)
             {
                 Debug($"QueueAdd patch failed — refund/auto-complete unavailable: {ex.Message}");
+            }
+        }
+
+        private bool _dedupePatchAttempted;
+
+        // Guard against a vanilla game bug (identified 2026-07-12): the game
+        // attaches its redemption handler twice in menu context (Startup plus a
+        // scene-bound attach, detached during gameplay), so menu-state
+        // redemptions execute every command twice. Invisible for a year while
+        // PubSub was dead; inherited when this mod resurrected the pipeline.
+        // Redemption ids are unique per redemption, so skipping a repeated id
+        // within a short window is a zero-false-positive fix.
+        private void ApplyRedemptionDedupePatch()
+        {
+            if (_dedupePatchAttempted || !_dedupeRedemptions.Value) return;
+            _dedupePatchAttempted = true;
+            try
+            {
+                var handler = _botType.GetMethod("Pubsub_OnChannelPointsRewardRedeemed",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+                if (handler == null)
+                {
+                    Debug("Redemption handler not found — dedupe guard unavailable.");
+                    return;
+                }
+                EnsureHarmony();
+                DedupeEnabled = true;
+                _harmony.Patch(handler, new HarmonyLib.HarmonyMethod(
+                    typeof(Core).GetMethod(nameof(RedemptionDedupePrefix), BindingFlags.Static | BindingFlags.NonPublic)));
+                Debug("Redemption dedupe guard applied.");
+            }
+            catch (Exception ex)
+            {
+                Debug($"Dedupe patch failed (continuing without): {ex.Message}");
+            }
+        }
+
+        private static bool RedemptionDedupePrefix(object __0, object __1)
+        {
+            try
+            {
+                if (!DedupeEnabled || __1 == null) return true;
+                var rr = GetMemberValue(__1.GetType(), __1, "RewardRedeemed", out _);
+                var red = rr == null ? null : GetMemberValue(rr.GetType(), rr, "Redemption", out _);
+                var id = red == null ? null : GetMemberValue(red.GetType(), red, "Id", out _) as string;
+                if (string.IsNullOrEmpty(id)) return true;
+
+                var now = DateTime.UtcNow;
+                if (RecentRedemptionIds.TryGetValue(id, out var seen) && (now - seen).TotalSeconds < 10)
+                {
+                    _dedupeBlockCount++;
+                    if (_dedupeBlockCount == 1)
+                        SLog.Msg("Blocked a duplicate redemption execution — known game quirk: the game double-processes redemptions while in the menu. The guard makes this harmless; further blocks log at debug level.");
+                    else if (DebugEntry != null && DebugEntry.Value)
+                        SLog.Msg($"[Debug] Blocked duplicate redemption {id} (x{_dedupeBlockCount} this session).");
+                    return false; // skip the game's handler for the duplicate
+                }
+                RecentRedemptionIds[id] = now;
+
+                if (RecentRedemptionIds.Count > 256)
+                {
+                    foreach (var kv in RecentRedemptionIds)
+                    {
+                        if ((now - kv.Value).TotalSeconds > 60) RecentRedemptionIds.TryRemove(kv.Key, out _);
+                    }
+                }
+                return true;
+            }
+            catch
+            {
+                return true; // never block on guard failure
             }
         }
 
@@ -443,6 +607,7 @@ namespace SynthChannelPoints
                 var st = settings.GetType();
 
                 var cpm = ReadBool(st, settings, "ChannelPointMode") ?? true;
+                var gate = !_rewardsFollowCpm.Value || cpm;
                 var map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
                 foreach (var spec in _rewardSpecs)
                 {
@@ -457,9 +622,24 @@ namespace SynthChannelPoints
                         }
                         featureOn = any ?? true;
                     }
-                    map[spec.Title] = cpm && featureOn;
+                    map[spec.Title] = gate && featureOn;
+                }
+
+                var previous = _desiredEnabled;
+                var changed = previous == null || previous.Count != map.Count;
+                if (!changed)
+                {
+                    foreach (var kv in map)
+                    {
+                        if (!previous.TryGetValue(kv.Key, out var old) || old != kv.Value)
+                        {
+                            changed = true;
+                            break;
+                        }
+                    }
                 }
                 _desiredEnabled = map;
+                if (changed) _syncNow = true;
             }
             catch (Exception ex)
             {
@@ -761,6 +941,7 @@ namespace SynthChannelPoints
                                 {
                                     var ev = payload.GetProperty("event");
                                     if (TryHandleEmptyInput(ev)) break;
+                                    if (TryHandleDisabledReward(ev)) break;
                                     var envelope = BuildEnvelopeFromEventSub(ev);
                                     if (envelope != null)
                                     {
@@ -968,10 +1149,14 @@ namespace SynthChannelPoints
                     await ProcessPendingAsync(http, creds, clientId, ct).ConfigureAwait(false);
 
                     // Slow path every ~16s: ensure rewards exist and mirror toggles.
-                    // After repeated 403s (no affiliate — won't change mid-session),
-                    // back off to roughly every 5 minutes.
+                    // A settings change triggers an immediate pass (~2s) so
+                    // toggling Channel Point Mode off removes rewards promptly.
+                    // After repeated 403s (no affiliate — won't change
+                    // mid-session), back off to roughly every 5 minutes.
                     var interval = consecutiveForbidden >= 3 ? 160 : 8;
-                    if (tick % interval != 0) continue;
+                    var syncRequested = _syncNow && consecutiveForbidden < 3;
+                    if (tick % interval != 0 && !syncRequested) continue;
+                    _syncNow = false;
 
                     var rewards = await GetManageableRewardsAsync(http, creds, clientId, ct).ConfigureAwait(false);
                     if (rewards == null)
@@ -999,11 +1184,29 @@ namespace SynthChannelPoints
 
                     var desired = _desiredEnabled;
 
+                    // Rewards we created under a previous config (e.g. before a
+                    // rename) match no current spec: disable them rather than
+                    // leave redeemable rewards the game no longer maps to.
+                    foreach (var kv in rewards)
+                    {
+                        var matchesSpec = false;
+                        foreach (var s in _rewardSpecs)
+                        {
+                            if (string.Equals(kv.Value.Title, s.Title, StringComparison.OrdinalIgnoreCase)) { matchesSpec = true; break; }
+                        }
+                        if (matchesSpec || !kv.Value.Enabled) continue;
+                        if (await PatchRewardAsync(http, creds, clientId, kv.Key, false, null, null, ct).ConfigureAwait(false))
+                        {
+                            RateWarn("orphan-" + kv.Key, $"Reward '{kv.Value.Title}' no longer matches any configured command (renamed in config?) — disabled it. Delete it on your Twitch dashboard if unwanted.");
+                        }
+                    }
+
                     foreach (var spec in _rewardSpecs)
                     {
                         string existingId = null;
                         var existingEnabled = false;
                         long existingCost = 0;
+                        string existingPrompt = "";
                         foreach (var kv in rewards)
                         {
                             if (string.Equals(kv.Value.Title, spec.Title, StringComparison.OrdinalIgnoreCase))
@@ -1011,6 +1214,7 @@ namespace SynthChannelPoints
                                 existingId = kv.Key;
                                 existingEnabled = kv.Value.Enabled;
                                 existingCost = kv.Value.Cost;
+                                existingPrompt = kv.Value.Prompt ?? "";
                                 break;
                             }
                         }
@@ -1036,11 +1240,14 @@ namespace SynthChannelPoints
                         remoteEnabled[existingId] = existingEnabled;
                         var enabledDrift = desired != null && existingEnabled != wantEnabled;
                         var costDrift = existingCost > 0 && existingCost != spec.Cost;
-                        if (enabledDrift || costDrift)
+                        var desiredPrompt = (spec.Prompt ?? "").Trim();
+                        var promptDrift = !string.Equals(existingPrompt.Trim(), desiredPrompt, StringComparison.Ordinal);
+                        if (enabledDrift || costDrift || promptDrift)
                         {
                             if (await PatchRewardAsync(http, creds, clientId, existingId,
                                     enabledDrift ? (bool?)wantEnabled : null,
-                                    costDrift ? (long?)spec.Cost : null, ct).ConfigureAwait(false))
+                                    costDrift ? (long?)spec.Cost : null,
+                                    promptDrift ? desiredPrompt : null, ct).ConfigureAwait(false))
                             {
                                 if (enabledDrift)
                                 {
@@ -1049,6 +1256,8 @@ namespace SynthChannelPoints
                                 }
                                 if (costDrift)
                                     LoggerInstance.Msg($"Reward '{spec.Title}' cost updated to {spec.Cost} points (from config).");
+                                if (promptDrift)
+                                    LoggerInstance.Msg($"Reward '{spec.Title}' description updated (from config).");
                             }
                         }
                     }
@@ -1099,26 +1308,59 @@ namespace SynthChannelPoints
 
                 LoggerInstance.Warning($"Dropped redemption of '{title}' with empty input — the game would silently consume it without queuing anything. If this reward was created manually, enable 'Require Viewer to Enter Text' on your Twitch dashboard.");
 
-                if (!string.IsNullOrEmpty(rewardId) && _refundFailedRequests.Value)
+                QueueImmediateRefundIfManaged(ev, rewardId);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Queue an instant CANCELED for a redemption we are dropping, when the
+        // reward is mod-managed and refunds are enabled. Returns true if queued.
+        private bool QueueImmediateRefundIfManaged(JsonElement ev, string rewardId)
+        {
+            if (string.IsNullOrEmpty(rewardId) || !_refundFailedRequests.Value) return false;
+            bool managed;
+            lock (_managedRewards) { managed = _managedRewards.ContainsKey(rewardId); }
+            if (!managed) return false;
+            var p = new Pending
+            {
+                RedemptionId = ev.TryGetProperty("id", out var idEl) ? idEl.GetString() : null,
+                RewardId = rewardId,
+                UserLogin = ev.TryGetProperty("user_login", out var ul) ? ul.GetString() : null,
+                UserName = ev.TryGetProperty("user_name", out var un) ? un.GetString() : null,
+                DeadlineUtc = DateTime.MinValue // refund on the next manage tick
+            };
+            if (string.IsNullOrEmpty(p.RedemptionId)) return false;
+            lock (_pending) { _pending.Add(p); }
+            return true;
+        }
+
+        // The game never gated redemption handling on channelpointmode — per its
+        // own docs (and mock-verified), that flag only blocks chat commands. When
+        // the mirror says a reward should be disabled, redemptions that slip
+        // through anyway (mirror lag, leftovers after a crash-exit, mock tests)
+        // are dropped here and refunded where possible.
+        private bool TryHandleDisabledReward(JsonElement ev)
+        {
+            try
+            {
+                var desired = _desiredEnabled;
+                if (desired == null) return false;
+
+                string title = null, rewardId = null;
+                if (ev.TryGetProperty("reward", out var reward) && reward.ValueKind == JsonValueKind.Object)
                 {
-                    bool managed;
-                    lock (_managedRewards) { managed = _managedRewards.ContainsKey(rewardId); }
-                    if (managed)
-                    {
-                        var p = new Pending
-                        {
-                            RedemptionId = ev.TryGetProperty("id", out var idEl) ? idEl.GetString() : null,
-                            RewardId = rewardId,
-                            UserLogin = ev.TryGetProperty("user_login", out var ul) ? ul.GetString() : null,
-                            UserName = ev.TryGetProperty("user_name", out var un) ? un.GetString() : null,
-                            DeadlineUtc = DateTime.MinValue // refund on the next manage tick
-                        };
-                        if (!string.IsNullOrEmpty(p.RedemptionId))
-                        {
-                            lock (_pending) { _pending.Add(p); }
-                        }
-                    }
+                    title = reward.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
+                    rewardId = reward.TryGetProperty("id", out var ri) && ri.ValueKind == JsonValueKind.String ? ri.GetString() : null;
                 }
+                if (string.IsNullOrEmpty(title)) return false;
+                if (!desired.TryGetValue(title, out var enabled) || enabled) return false;
+
+                var refundQueued = QueueImmediateRefundIfManaged(ev, rewardId);
+                LoggerInstance.Msg($"Dropped redemption of '{title}' — this reward is disabled per the game's Twitch settings.{(refundQueued ? " Points will be refunded." : "")}");
                 return true;
             }
             catch
@@ -1224,6 +1466,7 @@ namespace SynthChannelPoints
             public string Title;
             public bool Enabled;
             public long Cost;
+            public string Prompt;
         }
 
         private async Task<Dictionary<string, RemoteReward>> GetManageableRewardsAsync(HttpClient http, Creds creds, string clientId, CancellationToken ct)
@@ -1259,7 +1502,8 @@ namespace SynthChannelPoints
                         {
                             Title = item.TryGetProperty("title", out var t) ? t.GetString() : "",
                             Enabled = item.TryGetProperty("is_enabled", out var e) && e.ValueKind == JsonValueKind.True,
-                            Cost = item.TryGetProperty("cost", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetInt64() : 0
+                            Cost = item.TryGetProperty("cost", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetInt64() : 0,
+                            Prompt = item.TryGetProperty("prompt", out var pr) && pr.ValueKind == JsonValueKind.String ? pr.GetString() : ""
                         };
                     }
                 }
@@ -1281,7 +1525,7 @@ namespace SynthChannelPoints
                     "{\"title\":\"" + J(spec.Title) + "\"," +
                     "\"cost\":" + spec.Cost + "," +
                     "\"is_user_input_required\":" + (spec.RequiresInput ? "true" : "false") + "," +
-                    (spec.RequiresInput ? "\"prompt\":\"Enter your request\"," : "") +
+                    (string.IsNullOrEmpty(spec.Prompt) ? "" : "\"prompt\":\"" + J(spec.Prompt) + "\",") +
                     "\"is_enabled\":" + (enabled ? "true" : "false") + "}";
 
                 using var req = new HttpRequestMessage(HttpMethod.Post, url);
@@ -1322,7 +1566,7 @@ namespace SynthChannelPoints
             }
         }
 
-        private async Task<bool> PatchRewardAsync(HttpClient http, Creds creds, string clientId, string rewardId, bool? enabled, long? cost, CancellationToken ct)
+        private async Task<bool> PatchRewardAsync(HttpClient http, Creds creds, string clientId, string rewardId, bool? enabled, long? cost, string prompt, CancellationToken ct)
         {
             try
             {
@@ -1330,6 +1574,7 @@ namespace SynthChannelPoints
                 var parts = new List<string>();
                 if (enabled.HasValue) parts.Add("\"is_enabled\":" + (enabled.Value ? "true" : "false"));
                 if (cost.HasValue) parts.Add("\"cost\":" + cost.Value);
+                if (prompt != null) parts.Add("\"prompt\":\"" + J(prompt) + "\"");
                 if (parts.Count == 0) return true;
                 using var req = new HttpRequestMessage(HttpMethod.Patch, url);
                 req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + creds.AccessToken);
@@ -1465,6 +1710,71 @@ namespace SynthChannelPoints
         // Helpers
         // ==================================================================
 
+        // Applies "command | Title | Description | cost | input" overrides
+        // (';'-separated) on top of the base spec list. Per the game's own
+        // documentation, the chat command only needs to appear in the reward's
+        // description for the game to recognize it — so titles can be fully
+        // cosmetic.
+        private static void ApplyRewardDefinitions(List<RewardSpec> specs, string config, string prefix)
+        {
+            if (string.IsNullOrWhiteSpace(config)) return;
+            foreach (var raw in config.Split(';'))
+            {
+                var entry = raw.Trim();
+                if (entry.Length == 0) continue;
+                var f = entry.Split('|');
+                var cmd = f[0].Trim();
+                if (cmd.Length == 0) continue;
+
+                RewardSpec spec = null;
+                foreach (var s in specs)
+                {
+                    if (string.Equals(s.Command, cmd, StringComparison.OrdinalIgnoreCase)) { spec = s; break; }
+                }
+                if (spec == null)
+                {
+                    spec = new RewardSpec { Command = cmd, Title = prefix + cmd, Prompt = "", Cost = 500, RequiresInput = false };
+                    specs.Add(spec);
+                }
+
+                if (f.Length > 1 && f[1].Trim().Length > 0) spec.Title = f[1].Trim();
+                if (f.Length > 2 && f[2].Trim().Length > 0) spec.Prompt = f[2].Trim();
+                if (f.Length > 3 && long.TryParse(f[3].Trim(), out var cost) && cost > 0) spec.Cost = cost;
+                if (f.Length > 4 && f[4].Trim().Equals("input", StringComparison.OrdinalIgnoreCase)) spec.RequiresInput = true;
+            }
+        }
+
+        // Safety net: per the official integration guide, the game activates
+        // whatever command tokens it finds in the reward title OR description —
+        // one reward may carry several. A reward containing no known token
+        // would eat viewer points, so append this spec's token only when the
+        // title+description contain no recognizable command at all.
+        // Twitch caps prompts at 200 characters.
+        private void EnsureCommandTokens()
+        {
+            var knownTokens = new List<string>();
+            foreach (var s in _rewardSpecs) knownTokens.Add(_commandPrefix.Value + s.Command);
+
+            foreach (var spec in _rewardSpecs)
+            {
+                var haystack = (spec.Title ?? "") + " " + (spec.Prompt ?? "");
+                var discoverable = false;
+                foreach (var t in knownTokens)
+                {
+                    if (haystack.IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0) { discoverable = true; break; }
+                }
+                if (discoverable) continue;
+                var token = _commandPrefix.Value + spec.Command;
+
+                var basePrompt = spec.Prompt ?? "";
+                var appended = basePrompt.Length == 0 ? token : basePrompt + " " + token;
+                if (appended.Length > 200)
+                    appended = appended.Substring(0, Math.Max(0, 199 - token.Length)).TrimEnd() + " " + token;
+                spec.Prompt = appended;
+                LoggerInstance.Msg($"Reward '{spec.Title}': appended '{token}' to its description so the game can recognize it.");
+            }
+        }
+
         private static List<RewardSpec> ParseRewardSpecs(string config, string prefix)
         {
             var specs = new List<RewardSpec>();
@@ -1478,7 +1788,8 @@ namespace SynthChannelPoints
                 {
                     Command = parts[0].Trim(),
                     Cost = 500,
-                    RequiresInput = false
+                    RequiresInput = false,
+                    Prompt = ""
                 };
                 if (spec.Command.Length == 0) continue;
                 for (int i = 1; i < parts.Length; i++)
@@ -1490,6 +1801,7 @@ namespace SynthChannelPoints
                         spec.Cost = cost;
                 }
                 spec.Title = prefix + spec.Command;
+                if (spec.RequiresInput && spec.Prompt.Length == 0) spec.Prompt = "Enter your request";
                 specs.Add(spec);
             }
             return specs;
@@ -1569,7 +1881,7 @@ namespace SynthChannelPoints
                             string.Equals(u.Scheme, "wss", StringComparison.OrdinalIgnoreCase);
                 if (isLocal && isTls)
                 {
-                    LoggerInstance.Warning($"{entryName} uses {u.Scheme}:// against {u.Host} — the Twitch CLI mock server is plain {(u.Scheme.StartsWith("w", StringComparison.OrdinalIgnoreCase) ? "ws" : "http")}://. This will fail with SSL errors; fix the scheme in MelonPreferences.cfg.");
+                    LoggerInstance.Warning($"{entryName} uses {u.Scheme}:// against {u.Host} — the Twitch CLI mock server is plain {(u.Scheme.StartsWith("w", StringComparison.OrdinalIgnoreCase) ? "ws" : "http")}://. This will fail with SSL errors; fix the scheme in UserData/SynthChannelPoints.cfg.");
                 }
             }
             catch { }
