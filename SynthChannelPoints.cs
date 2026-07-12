@@ -13,7 +13,7 @@ using MelonLoader;
 using MelonLoader.Utils;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(SynthChannelPoints.Core), "SynthChannelPoints", "1.2.0", "OmniDreamer")]
+[assembly: MelonInfo(typeof(SynthChannelPoints.Core), "SynthChannelPoints", "1.2.2", "OmniDreamer")]
 [assembly: MelonGame(null, null)]
 
 namespace SynthChannelPoints
@@ -279,7 +279,7 @@ namespace SynthChannelPoints
             ApplyRewardDefinitions(_rewardSpecs, _rewardDefinitions.Value, _commandPrefix.Value);
             EnsureCommandTokens();
 
-            LoggerInstance.Msg("SynthChannelPoints v1.2.0 loaded — channel point redemptions via EventSub.");
+            LoggerInstance.Msg("SynthChannelPoints v1.2.2 loaded — channel point redemptions via EventSub.");
 
             const string defaultEventSub = "wss://eventsub.wss.twitch.tv/ws";
             const string defaultHelix = "https://api.twitch.tv/helix/eventsub/subscriptions";

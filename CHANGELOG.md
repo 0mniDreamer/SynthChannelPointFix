@@ -1,20 +1,25 @@
 # Changelog
 
-## 1.2.0
-- **Friendly reward names by default**: rewards are now created as "Song Request", "Slow Motion", "Rainbow Notes" etc., with the chat command in the description (description-based matching verified live). Existing plain-titled rewards are auto-disabled as orphans — delete them on your dashboard
-- **Custom reward names and descriptions** (`RewardDefinitions`): rewards can now have cosmetic titles (e.g. "Song Request" instead of "!srr") with the chat command placed in the description, per the game's documentation. Format: `command | Title | Description | cost | input`, rewards separated by ';'
-- Safety net: if a reward's title and description contain no recognizable command token, this reward's token is appended to the description automatically — a reward the game can't recognize would silently eat viewer points. Rewards carrying other commands' tokens (multi-command rewards, per the official guide) are left untouched
-- Description changes sync to Twitch like cost changes; renamed rewards' old versions are disabled automatically (delete them on the dashboard if unwanted)
-- Redemptions of rewards the mod considers disabled are now dropped and refunded — the game itself never gated redemptions on channelpointmode (that flag only blocks chat commands, per the official guide; mock-verified), so this closes the mirror-lag and crash-leftover windows
-- Dedupe guard (`DeduplicateRedemptions`, default on) for a vanilla game bug: the game attaches its redemption handler twice while in the menu, so menu-state redemptions executed every command twice (invisible for a year while PubSub was dead). Redemption ids are unique, so the guard fixes it with zero risk of blocking a legitimate redemption
-- Config moved to its own file, `UserData/SynthChannelPoints.cfg` — existing settings migrate automatically on first launch; the old section in MelonPreferences.cfg can be deleted
-- New `RewardsFollowChannelPointMode` (default true): true keeps the chat-mode/rewards-mode behavior; false lets rewards follow only their feature toggles so chat and redemptions work simultaneously (vanilla semantics)
+## 1.2.2
 
+### Reward customization
+- **Friendly reward names by default**: rewards are created as "Song Request", "Slow Motion", "Rainbow Notes", etc., with the chat command in the description — description-based command matching per the official integration guide, verified live on input and effect rewards
+- **`RewardDefinitions` config**: customize any reward's title, description, cost, and input flag (`command | Title | Description | cost | input`, ';'-separated); descriptions sync to Twitch like costs, and renamed rewards' old versions are auto-disabled as orphans
+- **Multi-command rewards**: one reward can trigger several commands by carrying multiple tokens in its description (e.g. a HyperDrive reward firing `!warp !superspeed`) — verified live
+- Safety net: a reward whose title and description contain no recognizable command token gets its token appended automatically, so no configuration can create a reward that silently eats points
 
-## 1.1.2
-- Rewards are disabled automatically when the game closes (`DisableRewardsOnExit`, default on) — previously they stayed redeemable in the channel's points menu with nothing running to respond or refund. They re-enable on next launch per your settings
-- Settings changes now mirror to Twitch within ~2 seconds instead of up to 16 — turning Channel Point Mode off removes the rewards from chat almost immediately, leaving chat commands as the only path
+### Fixes a vanilla game bug
+- **Redemption dedupe guard** (`DeduplicateRedemptions`, default on): the game attaches its redemption handler twice while in the menu, so menu-state redemptions executed every command twice — invisible since April 2025 because no redemptions could arrive. Redemption ids are unique, so the guard runs each redemption exactly once with zero risk to legitimate traffic
 
+### Channel Point Mode semantics
+- Per the official guide (and mock-verified), the game's `channelpointmode` only blocks chat commands — it never gated redemptions. Redemptions of rewards the mod considers disabled are now dropped and refunded, closing the sync-lag and crash-leftover windows
+- New **`RewardsFollowChannelPointMode`** (default true): true keeps the clean chat-mode/rewards-mode switch; false lets rewards follow only their feature toggles so chat and redemptions work simultaneously (vanilla semantics)
+
+### Lifecycle & housekeeping
+- **Rewards disable automatically when the game closes** (`DisableRewardsOnExit`, default on) — no more redeemable rewards sitting in your chat with nothing running to respond or refund; they re-enable on next launch
+- **Settings changes mirror to Twitch within ~2 seconds** instead of up to 16
+- **Config moved to its own file**, `UserData/SynthChannelPoints.cfg` — existing settings migrate automatically on first launch; the old `[SynthChannelPoints]` section in `MelonPreferences.cfg` can be deleted
+- Explicit warnings for common config mistakes (https/wss schemes pointed at the localhost mock server)
 
 ## 1.1.1
 - Refund deadline raised 15s → 30s: live testing measured successful queue-adds up to ~16s after redemption, which risked refunding a successful request
