@@ -35,9 +35,21 @@ Drop `SynthChannelPoints.dll` into your `Mods` folder:
 
 ## Setting up rewards
 
-Create channel point rewards on your Twitch dashboard named **exactly like the chat command**, including the prefix. For song requests: a reward titled `!srr` with "Require Viewer to Enter Text" enabled — the viewer's text is the song search. Other commands follow the same pattern (e.g. `!timewarp`). This is the naming the game itself expects; the mod doesn't change it.
+The mod creates and names rewards for you. By default they get friendly names with the command in the description — "Song Request", "Slow Motion", "Rainbow Notes" and so on. Customize any of them (or add multi-command rewards) via `RewardDefinitions` — per the game's documentation, the command only needs to appear in the reward's **description** for the game to recognize it, e.g.:
 
-## Config (`UserData/MelonPreferences.cfg` → `[SynthChannelPoints]`)
+```
+RewardDefinitions = "srr | Song Request | Request any song! Powered by !srr | 500 | input ; timewarp | Slow Motion | Slows the song for a moment (!timewarp)"
+```
+
+If you forget to include a command anywhere, the mod appends it to the description automatically — a reward the game can't recognize would just eat viewer points.
+
+Per the official integration guide, a single reward may carry **multiple** command tokens (each activates once) — e.g. a "Chaos Mode" reward with `!rainbow !vanish !embiggen` in its description fires all three. The invader-count variants `!1invaderz`, `!2invaderz`, `!3invaderz` are also valid tokens.
+
+**Refunds and the game's token system:** when a song-request redemption finds no match, the game grants the viewer a request token (usable later with chat `!srr`) — and with `RefundFailedRequests` on, the mod refunds their points as well. That double compensation is deliberate generosity; set `RefundFailedRequests = false` if you prefer the game's token-only behavior.
+
+## Config (`UserData/SynthChannelPoints.cfg`)
+
+The mod keeps its settings in its own file so the shared `MelonPreferences.cfg` stays clean. On first launch after updating, existing settings migrate over automatically.
 
 | Entry | Default | Purpose |
 |---|---|---|
@@ -49,7 +61,10 @@ Create channel point rewards on your Twitch dashboard named **exactly like the c
 | `ManageRewards` | `true` | Auto-create rewards, mirror settings, enable refunds (needs one-time re-consent) |
 | `RewardCommands` | all game commands | Rewards to manage: `command[:cost][:input]`, comma-separated |
 | `CommandPrefix` | `!` | Prefix used in reward titles |
+| `RewardDefinitions` | friendly names for all commands | Custom names/descriptions: `command \| Title \| Description \| cost \| input`, ';'-separated. Set to a single command entry or edit freely; costs default from `RewardCommands` |
 | `RefundFailedRequests` | `true` | Refund points when a song request fails |
+| `DisableRewardsOnExit` | `true` | Disable managed rewards when the game closes; re-enabled on next launch |
+| `RewardsFollowChannelPointMode` | `true` | Hide rewards while Channel Point Mode is off (see below) |
 | `AutoCompleteRequests` | `true` | Mark successful requests FULFILLED |
 | `HelixBaseUrl` | `https://api.twitch.tv/helix` | Helix base for reward management |
 
@@ -63,11 +78,15 @@ Create channel point rewards on your Twitch dashboard named **exactly like the c
 
 **"Helix rejected the subscription (403)"** — your Twitch account doesn't have channel points available (Affiliate/Partner required).
 
-**"Non-default endpoints configured"** — you previously tested against the Twitch CLI mock server; delete the two URL entries from `MelonPreferences.cfg` (they'll regenerate with live defaults).
+**"Non-default endpoints configured"** — you previously tested against the Twitch CLI mock server; delete the two URL entries from `UserData/SynthChannelPoints.cfg` (they'll regenerate with live defaults).
 
 **`!invaderz` redemptions reply "N Bits until the next Invader"** — working as designed: the Invaderz feature runs on a bits meter, and a redemption contributes its point cost toward it (shared with real cheered bits). Two 300-point redemptions against a 500-bit threshold spawn one invader. For one-redemption-one-invader, set the reward cost to meet your in-game bits threshold (e.g. `invaderz:500` in `RewardCommands`) or lower the threshold in the game's Twitch settings.
 
+**What Channel Point Mode actually does** — per the official guide, the game's `channelpointmode` flag only controls whether *chat* commands are blocked (true = rewards-only); the game never disabled redemptions with it. With `RewardsFollowChannelPointMode = true` (default), the mod turns it into a clean mode switch: CPM on = rewards-only, CPM off = chat-only (rewards hidden on Twitch, and any redemption slipping through the sync window is dropped and refunded). Set it to `false` for the vanilla behavior where chat commands and redemptions both work at once.
+
 **No `!srr` reward appears (but effect rewards do)** — the song-request reward mirrors a dedicated toggle in the game's Twitch settings (separate from chat requests). Enable it in-game and the reward is created within ~16 seconds.
+
+**"Blocked a duplicate redemption execution" in the console** — working as intended: the game itself double-processes redemptions while you're in the menu (a vanilla bug that predates this mod); the guard runs each redemption exactly once.
 
 **Redemptions arrive but nothing happens in game** — check the reward title matches the chat command exactly (including `!`), and that Channel Point Mode + the specific feature are enabled in the game's Twitch settings.
 
